@@ -63,9 +63,9 @@
 #ifdef HAVE_WAYLAND_CURSOR_SHAPE
 #include "cursor-shape-v1-protocol.h"
 #endif
+#include "keyboard-shortcuts-inhibit-unstable-v1-protocol.h"
 #include "primary-selection-unstable-v1-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
-#include "keyboard-shortcuts-inhibit-unstable-v1-protocol.h"
 
 #define wayland_output_get_dpi(output, scale, dimension)                       \
   ((output)->current.physical_##dimension > 0 && (scale) > 0                   \
@@ -152,8 +152,7 @@ static void wayland_buffer_release(void *data, struct wl_buffer *buffer) {
 }
 
 static const struct wl_buffer_listener wayland_buffer_listener = {
-    wayland_buffer_release
-};
+    wayland_buffer_release};
 
 wayland_buffer_pool *display_buffer_pool_new(gint width, gint height) {
   struct wl_shm_pool *wl_pool;
@@ -531,6 +530,107 @@ static const struct wl_keyboard_listener wayland_keyboard_listener = {
     .repeat_info = wayland_keyboard_repeat_info,
 };
 
+static void wayland_touch_down(void *data, struct wl_touch *wl_touch,
+                               uint32_t serial, uint32_t time,
+                               struct wl_surface *wl_surface, int32_t id,
+                               wl_fixed_t surface_x, wl_fixed_t surface_y) {
+  wayland_seat *self = data;
+  if (id >= MAX_TOUCHPOINTS) {
+    return;
+  }
+  self->touches[id].x = wl_fixed_to_int(surface_x);
+  self->touches[id].start_y = self->touches[id].move_y =
+      wl_fixed_to_int(surface_y);
+  self->touches[id].start_time = self->touches[id].move_time = time;
+  RofiViewState *state = rofi_view_get_active();
+
+  if (state == NULL) {
+    return;
+  }
+  rofi_view_handle_mouse_motion(state, self->touches[id].x,
+                                self->touches[id].start_y, FALSE);
+}
+
+static void wayland_touch_up(void *data, struct wl_touch *wl_touch,
+                             uint32_t serial, uint32_t time, int32_t id) {
+  wayland_seat *self = data;
+  int key = KEY_ENTER;
+  int long_press_threshold = 200;
+  if (id >= MAX_TOUCHPOINTS) {
+    return;
+  }
+  gboolean has_moved =
+      self->touches[id].start_time != self->touches[id].move_time;
+  if (has_moved) {
+    return;
+  }
+  RofiViewState *state = rofi_view_get_active();
+
+  if (state == NULL) {
+    return;
+  }
+  if (time - self->touches[id].start_time > long_press_threshold) {
+    key = KEY_ESC;
+  }
+  nk_bindings_seat_handle_key(wayland->bindings_seat, NULL, key + 8,
+                              NK_BINDINGS_KEY_STATE_PRESS);
+  rofi_view_maybe_update(state);
+}
+
+// TODO: make sensitivity parametrizable
+static int32_t y_offset_to_line_offset(int32_t y_offset) {
+  static const int32_t line_height = 20;
+  return -(y_offset / line_height);
+}
+
+static void wayland_touch_motion(void *data, struct wl_touch *wl_touch,
+                                 uint32_t time, int32_t id,
+                                 wl_fixed_t surface_x, wl_fixed_t surface_y) {
+  wayland_seat *self = data;
+  if (id >= MAX_TOUCHPOINTS) {
+    return;
+  }
+  RofiViewState *state = rofi_view_get_active();
+
+  if (state == NULL) {
+    return;
+  }
+  int32_t x = wl_fixed_to_int(surface_x);
+  int32_t y = wl_fixed_to_int(surface_y);
+
+  int last_pos = y_offset_to_line_offset(self->touches[id].move_y -
+                                         self->touches[id].start_y);
+  int cur_pos = y_offset_to_line_offset(y - self->touches[id].start_y);
+
+  if (cur_pos != last_pos) {
+    nk_bindings_seat_handle_scroll(wayland->bindings_seat, NULL,
+                                   NK_BINDINGS_SCROLL_AXIS_VERTICAL,
+                                   cur_pos - last_pos);
+    self->touches[id].x = x;
+    self->touches[id].move_y = y;
+    self->touches[id].move_time = time;
+    rofi_view_maybe_update(state);
+  }
+}
+
+static void wayland_touch_frame(void *data, struct wl_touch *wl_touch) {}
+static void wayland_touch_cancel(void *data, struct wl_touch *wl_touch) {}
+static void wayland_touch_shape(void *data, struct wl_touch *wl_touch,
+                                int32_t id, wl_fixed_t major,
+                                wl_fixed_t minor) {}
+static void wayland_touch_orientation(void *data, struct wl_touch *wl_touch,
+                                      int32_t id, wl_fixed_t orientation) {}
+
+static const struct wl_touch_listener wayland_touch_listener = {
+    .down = wayland_touch_down,
+    .up = wayland_touch_up,
+    .motion = wayland_touch_motion,
+    .frame = wayland_touch_frame,
+    .cancel = wayland_touch_cancel,
+    .shape = wayland_touch_shape,
+    .orientation = wayland_touch_orientation,
+};
+
 static gboolean wayland_cursor_reload_theme(guint scale);
 
 static void wayland_cursor_set_image(int i) {
@@ -864,11 +964,9 @@ static void wayland_pointer_axis_discrete(void *data,
 }
 
 #ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
-static void wayland_pointer_axis120(void *data,
-                      struct wl_pointer *wl_pointer,
-                      enum wl_pointer_axis  axis,
-                      int32_t value120)
-{
+static void wayland_pointer_axis120(void *data, struct wl_pointer *wl_pointer,
+                                    enum wl_pointer_axis axis,
+                                    int32_t value120) {
   wayland_seat *self = data;
 
   switch (axis) {
@@ -929,8 +1027,9 @@ static gboolean clipboard_read_glib_callback(GIOChannel *channel,
   struct clipboard_read_info *info = opaque;
   gsize read;
 
-  GIOStatus status = g_io_channel_read_chars(channel, info->buffer + info->size,
-                                             CLIPBOARD_READ_INCREMENT, &read, NULL);
+  GIOStatus status =
+      g_io_channel_read_chars(channel, info->buffer + info->size,
+                              CLIPBOARD_READ_INCREMENT, &read, NULL);
   switch (status) {
   case G_IO_STATUS_AGAIN:
     return TRUE;
@@ -953,7 +1052,7 @@ static gboolean clipboard_read_glib_callback(GIOChannel *channel,
     info->buffer[info->size] = '\0';
     if (status == G_IO_STATUS_EOF) {
       info->callback(info->buffer, info->user_data);
-    } else {  // G_IO_STATUS_ERROR
+    } else { // G_IO_STATUS_ERROR
       g_warning("Could not read data from clipboard");
       g_free(info->buffer);
     }
@@ -965,7 +1064,8 @@ static gboolean clipboard_read_glib_callback(GIOChannel *channel,
   }
 }
 
-static gboolean clipboard_read_data(int fd, ClipboardCb callback, void *user_data) {
+static gboolean clipboard_read_data(int fd, ClipboardCb callback,
+                                    void *user_data) {
   GIOChannel *channel = g_io_channel_unix_new(fd);
 
   struct clipboard_read_info *info = g_malloc(sizeof *info);
@@ -1016,23 +1116,25 @@ static void data_device_handle_data_offer(void *data,
   wl_data_offer_add_listener(offer, &data_offer_listener, NULL);
 }
 
-static void data_device_handle_enter(void *data, struct wl_data_device *wl_data_device,
-                                     uint32_t serial, struct wl_surface *surface,
-                                     wl_fixed_t x, wl_fixed_t y,
-                                     struct wl_data_offer *id) {
-}
+static void data_device_handle_enter(void *data,
+                                     struct wl_data_device *wl_data_device,
+                                     uint32_t serial,
+                                     struct wl_surface *surface, wl_fixed_t x,
+                                     wl_fixed_t y, struct wl_data_offer *id) {}
 
-static void data_device_handle_leave(void *data, struct wl_data_device *wl_data_device) {
-}
+static void data_device_handle_leave(void *data,
+                                     struct wl_data_device *wl_data_device) {}
 
-static void data_device_handle_motion(void *data, struct wl_data_device *wl_data_device,
-                                      uint32_t time, wl_fixed_t x, wl_fixed_t y) {
-}
+static void data_device_handle_motion(void *data,
+                                      struct wl_data_device *wl_data_device,
+                                      uint32_t time, wl_fixed_t x,
+                                      wl_fixed_t y) {}
 
-static void data_device_handle_drop(void *data, struct wl_data_device *wl_data_device) {
-}
+static void data_device_handle_drop(void *data,
+                                    struct wl_data_device *wl_data_device) {}
 
-static void clipboard_handle_selection(enum clipboard_type cb_type, void *offer) {
+static void clipboard_handle_selection(enum clipboard_type cb_type,
+                                       void *offer) {
   clipboard_data *clipboard = &wayland->clipboards[cb_type];
 
   if (clipboard->offer != NULL) {
@@ -1043,7 +1145,6 @@ static void clipboard_handle_selection(enum clipboard_type cb_type, void *offer)
     }
   }
   clipboard->offer = offer;
-
 }
 
 static void data_device_handle_selection(void *data,
@@ -1107,9 +1208,20 @@ static void wayland_pointer_release(wayland_seat *self) {
   self->pointer = NULL;
 }
 
+static void wayland_touch_release(wayland_seat *self) {
+  if (self->touch == NULL) {
+    return;
+  }
+
+  wl_touch_release(self->touch);
+
+  self->touch = NULL;
+}
+
 static void wayland_seat_release(wayland_seat *self) {
   wayland_keyboard_release(self);
   wayland_pointer_release(self);
+  wayland_touch_release(self);
 
   wl_seat_release(self->seat);
 
@@ -1137,6 +1249,14 @@ static void wayland_seat_capabilities(void *data, struct wl_seat *seat,
   } else if ((!(capabilities & WL_SEAT_CAPABILITY_POINTER)) &&
              (self->pointer != NULL)) {
     wayland_pointer_release(self);
+  }
+
+  if ((capabilities & WL_SEAT_CAPABILITY_TOUCH) && (self->touch == NULL)) {
+    self->touch = wl_seat_get_touch(self->seat);
+    wl_touch_add_listener(self->touch, &wayland_touch_listener, self);
+  } else if ((!(capabilities & WL_SEAT_CAPABILITY_TOUCH)) &&
+             (self->touch != NULL)) {
+    wayland_touch_release(self);
   }
 
   if (wayland->data_device_manager != NULL) {
@@ -1295,19 +1415,22 @@ static void wayland_registry_handle_global(void *data,
     wayland->layer_shell =
         wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface,
                          MIN(version, WL_LAYER_SHELL_INTERFACE_VERSION));
-  } else if (g_strcmp0(interface, zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name) == 0) {
+  } else if (g_strcmp0(
+                 interface,
+                 zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name) ==
+             0) {
     wayland->global_names[WAYLAND_GLOBAL_KEYBOARD_SHORTCUTS_INHIBITOR] = name;
-    wayland->kb_shortcuts_inhibit_manager =
-        wl_registry_bind(registry, name, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface,
-                         MIN(version, WL_KEYBOARD_SHORTCUTS_INHIBITOR_INTERFACE_VERSION));
+    wayland->kb_shortcuts_inhibit_manager = wl_registry_bind(
+        registry, name, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface,
+        MIN(version, WL_KEYBOARD_SHORTCUTS_INHIBITOR_INTERFACE_VERSION));
   } else if (g_strcmp0(interface, wl_shm_interface.name) == 0) {
     wayland->global_names[WAYLAND_GLOBAL_SHM] = name;
     wayland->shm = wl_registry_bind(registry, name, &wl_shm_interface,
                                     MIN(version, WL_SHM_INTERFACE_VERSION));
   } else if (g_strcmp0(interface, wl_seat_interface.name) == 0) {
     if (version < WL_SEAT_INTERFACE_MIN_VERSION) {
-      g_error("Minimum version of wayland seat interface is %u, got %u", WL_SEAT_INTERFACE_MIN_VERSION,
-              version);
+      g_error("Minimum version of wayland seat interface is %u, got %u",
+              WL_SEAT_INTERFACE_MIN_VERSION, version);
       return;
     }
     version = MIN(version, WL_SEAT_INTERFACE_MAX_VERSION);
@@ -1321,8 +1444,8 @@ static void wayland_registry_handle_global(void *data,
     wl_seat_add_listener(seat->seat, &wayland_seat_listener, seat);
   } else if (g_strcmp0(interface, wl_output_interface.name) == 0) {
     if (version < WL_OUTPUT_INTERFACE_MIN_VERSION) {
-      g_error("Minimum version of wayland output interface is %u, got %u", WL_OUTPUT_INTERFACE_MIN_VERSION,
-              version);
+      g_error("Minimum version of wayland output interface is %u, got %u",
+              WL_OUTPUT_INTERFACE_MIN_VERSION, version);
       return;
     }
     version = MIN(version, WL_OUTPUT_INTERFACE_MAX_VERSION);
@@ -1382,7 +1505,8 @@ static void wayland_registry_handle_global_remove(void *data,
       wayland->layer_shell = NULL;
       break;
     case WAYLAND_GLOBAL_KEYBOARD_SHORTCUTS_INHIBITOR:
-      zwp_keyboard_shortcuts_inhibit_manager_v1_destroy(wayland->kb_shortcuts_inhibit_manager);
+      zwp_keyboard_shortcuts_inhibit_manager_v1_destroy(
+          wayland->kb_shortcuts_inhibit_manager);
       wayland->kb_shortcuts_inhibit_manager = NULL;
       break;
     case WAYLAND_GLOBAL_SHM:
@@ -1608,8 +1732,8 @@ static gboolean wayland_display_late_setup(void) {
     while (g_hash_table_iter_next(&iter, NULL, (gpointer *)&seat)) {
       // we don't need to keep track of these, they will get inactive when the
       // surface is destroyed
-      zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(wayland->kb_shortcuts_inhibit_manager,
-                                                                  wayland->surface, seat->seat);
+      zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(
+          wayland->kb_shortcuts_inhibit_manager, wayland->surface, seat->seat);
     }
   }
 
@@ -1774,7 +1898,8 @@ static const struct _view_proxy *wayland_display_view_proxy(void) {
 
 static guint wayland_display_scale(void) { return wayland->scale; }
 
-static void wayland_get_clipboard_data(int cb_type, ClipboardCb callback, void *user_data) {
+static void wayland_get_clipboard_data(int cb_type, ClipboardCb callback,
+                                       void *user_data) {
   clipboard_data *clipboard = &wayland->clipboards[cb_type];
 
   if (clipboard->offer == NULL) {
@@ -1789,7 +1914,8 @@ static void wayland_get_clipboard_data(int cb_type, ClipboardCb callback, void *
   if (cb_type == CLIPBOARD_DEFAULT) {
     wl_data_offer_receive(clipboard->offer, "text/plain", fds[1]);
   } else {
-    zwp_primary_selection_offer_v1_receive(clipboard->offer, "text/plain", fds[1]);
+    zwp_primary_selection_offer_v1_receive(clipboard->offer, "text/plain",
+                                           fds[1]);
   }
   close(fds[1]);
 
